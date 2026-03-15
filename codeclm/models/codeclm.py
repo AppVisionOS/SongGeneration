@@ -141,9 +141,18 @@ class CodecLM:
         texts, audio_qt_embs = self._prepare_tokens_and_attributes(lyrics=lyrics, melody_wavs=melody_wavs, vocal_wavs=vocal_wavs, bgm_wavs=bgm_wavs, melody_is_wav=melody_is_wav)
         tokens = self._generate_tokens(texts, descriptions, audio_qt_embs)
 
+        # EOS truncation: only honor EOS after a minimum sequence length.
+        # eos_token_id (default=2) is within the audio codebook range (0-16384),
+        # so early false positives can occur — especially with SDPA attention
+        # which has slight numerical differences from flash_attn.
+        min_eos_len = int(self.frame_rate * 5)  # at least 5 seconds of audio
         if (tokens == self.lm.eos_token_id).any():
             length = torch.nonzero(torch.eq(tokens, self.lm.eos_token_id))[:,-1].min()
-            tokens = tokens[...,:length] 
+            if length >= min_eos_len:
+                print(f"EOS at position {length.item()}/{tokens.shape[-1]}, truncating")
+                tokens = tokens[...,:length]
+            else:
+                print(f"EOS at position {length.item()}/{tokens.shape[-1]}, ignoring (< {min_eos_len} min length)")
 
         if return_tokens:
             return tokens
