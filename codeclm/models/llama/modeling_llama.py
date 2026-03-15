@@ -41,9 +41,9 @@ from transformers.utils import (
 from .configuration_llama import LlamaConfig
 
 
-if is_flash_attn_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+# Use PyTorch SDPA instead of flash_attn for portability.
+# The original code required flash_attn which needs custom CUDA compilation.
+_USE_SDPA = True
 
 
 logger = logging.get_logger(__name__)
@@ -501,55 +501,26 @@ class LlamaFlashAttention2(LlamaAttention):
     def _flash_attention_forward(
         self, query_states, key_states, value_states, padding_mask, query_length, dropout=0.0, softmax_scale=None
     ):
+        """Attention using PyTorch scaled_dot_product_attention (SDPA).
+
+        Drop-in replacement for flash_attn that works without the flash_attn
+        CUDA package.  Input tensors are (B, S, H, D); SDPA expects (B, H, S, D).
         """
-        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-        first unpad the input, then computes the attention scores and pad the final attention scores.
+        # (B, S, H, D) -> (B, H, S, D)
+        q = query_states.transpose(1, 2)
+        k = key_states.transpose(1, 2)
+        v = value_states.transpose(1, 2)
 
-        Args:
-            query_states (`torch.Tensor`):
-                Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
-                Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
-                Input value states to be passed to Flash Attention API
-            padding_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-                position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`int`, *optional*):
-                Attention dropout
-            softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-        """
-        # Contains at least one padding token in the sequence
-        if padding_mask is not None:
-            batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, padding_mask, query_length
-            )
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=dropout if self.training else 0.0,
+            is_causal=True,
+            scale=softmax_scale,
+        )
 
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=True,
-            )
-
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=True
-            )
-
-        return attn_output
+        # (B, H, S, D) -> (B, S, H, D)
+        return attn_output.transpose(1, 2)
 
     def _upad_input(self, query_layer, key_layer, value_layer, padding_mask, query_length):
         indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(padding_mask)
