@@ -511,11 +511,19 @@ class LlamaFlashAttention2(LlamaAttention):
         k = key_states.transpose(1, 2)
         v = value_states.transpose(1, 2)
 
+        # When using KV-cache during autoregressive generation, Q_len=1 while
+        # K_len=full_sequence.  is_causal=True would create a (1, K_len) lower-
+        # triangular mask that only lets the query attend to key position 0,
+        # effectively discarding all context.  The KV-cache already enforces
+        # causality (it only contains positions <= current), so we can safely
+        # disable the causal mask when Q_len < K_len.
+        use_causal = (q.size(2) == k.size(2))
+
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None,
             dropout_p=dropout if self.training else 0.0,
-            is_causal=True,
+            is_causal=use_causal,
             scale=softmax_scale,
         )
 
